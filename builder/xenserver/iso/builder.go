@@ -4,8 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"path"
-	"strings"
+	"strconv"
 	"time"
 
 	"github.com/mitchellh/multistep"
@@ -15,24 +14,29 @@ import (
 	"github.com/mitchellh/packer/packer"
 	"github.com/mitchellh/packer/template/interpolate"
 	xsclient "github.com/xenserver/go-xenserver-client"
-	xscommon "github.com/xenserver/packer-builder-xenserver/builder/xenserver/common"
+	xscommon "github.com/xenserverarmy/packer/builder/xenserver/common"
 )
 
 type config struct {
 	common.PackerConfig   `mapstructure:",squash"`
 	xscommon.CommonConfig `mapstructure:",squash"`
 
-	VMMemory      uint              `mapstructure:"vm_memory"`
-	DiskSize      uint              `mapstructure:"disk_size"`
-	CloneTemplate string            `mapstructure:"clone_template"`
-	VMOtherConfig map[string]string `mapstructure:"vm_other_config"`
+	VMMemory uint `mapstructure:"vm_memory"`
+	VMVCpus  uint `mapstructure:"vm_vcpus"`
+	// VMDisks uses a nested slice to enforce strict ordering of disk creation.
+	// This can be important for matching disk sizes to device names in Kickstart scripts,
+	// for example. maps make for a slightly prettier config syntax, but have a
+	// random iteration order which is not desirable here.
+	VMDisks       [][]string `mapstructure:"vm_disks"`
+	DiskSize      uint       `mapstructure:"disk_size"`
+	CloneTemplate string     `mapstructure:"clone_template"`
 
-	ISOChecksum     string   `mapstructure:"iso_checksum"`
-	ISOChecksumType string   `mapstructure:"iso_checksum_type"`
-	ISOUrls         []string `mapstructure:"iso_urls"`
-	ISOUrl          string   `mapstructure:"iso_url"`
-	ISOName         string   `mapstructure:"iso_name"`
+	ISOName   string `mapstructure:"iso_name"`
+	ISOSRName string `mapstructure:"iso_sr"`
+	NfsMount  string `mapstructure:"nfs_mount"`
 
+	ISOUrl       string            `mapstructure:"iso_url"`
+	ScriptUrl    string            `mapstructure:"script_url"`
 	PlatformArgs map[string]string `mapstructure:"platform_args"`
 
 	RawInstallTimeout string        `mapstructure:"install_timeout"`
@@ -74,8 +78,16 @@ func (self *Builder) Prepare(raws ...interface{}) (params []string, retErr error
 		self.config.RawInstallTimeout = "200m"
 	}
 
-	if self.config.DiskSize == 0 {
-		self.config.DiskSize = 40000
+	// For backwards compatibility, allow the existing disk_size option to be passed
+	// and to override the newer vm_disks map, if it's also found
+	if self.config.DiskSize > 0 {
+		self.config.VMDisks[0] = []string{"Packer-disk", strconv.FormatUint(uint64(self.config.DiskSize), 10)}
+	}
+
+	// If no disk info whatsoever is provided, fall back to the earlier standard of
+	// one 40GB volume named Packer-disk
+	if self.config.VMDisks == nil && self.config.DiskSize == 0 {
+		self.config.VMDisks[0] = []string{"Packer-disk", "40000"}
 	}
 
 	if self.config.VMMemory == 0 {
@@ -97,19 +109,15 @@ func (self *Builder) Prepare(raws ...interface{}) (params []string, retErr error
 		self.config.PlatformArgs = pargs
 	}
 
-	// Template substitution
-
-	templates := map[string]*string{
-		"clone_template":    &self.config.CloneTemplate,
-		"iso_checksum":      &self.config.ISOChecksum,
-		"iso_checksum_type": &self.config.ISOChecksumType,
-		"iso_url":           &self.config.ISOUrl,
-		"iso_name":          &self.config.ISOName,
-		"install_timeout":   &self.config.RawInstallTimeout,
-	}
-	for i := range self.config.ISOUrls {
-		templates[fmt.Sprintf("iso_urls[%d]", i)] = &self.config.ISOUrls[i]
-	}
+	// Template and environment substitution
+	/*	templates := map[string]*string{
+			"clone_template":    &self.config.CloneTemplate,
+			"network_name":      &self.config.NetworkName,
+			"iso_name":          &self.config.ISOName,
+			"iso_url":           &self.config.ISOUrl,
+			"install_timeout":   &self.config.RawInstallTimeout,
+		}
+	*/
 
 	// Validation
 
@@ -119,53 +127,20 @@ func (self *Builder) Prepare(raws ...interface{}) (params []string, retErr error
 			errs, fmt.Errorf("Failed to parse install_timeout: %s", err))
 	}
 
-	if self.config.ISOUrl == "" && self.config.ISOName == "" {
-		errs = packer.MultiErrorAppend(errs, fmt.Errorf("Either iso_url or iso_name must be specified"))
+	if self.config.ISOName == "" {
+		errs = packer.MultiErrorAppend(
+			errs, errors.New("You must specify the ISO name"))
 	}
 
 	if self.config.ISOUrl != "" {
-
-		// If ISO name is not specified, assume a URL and checksum has been provided.
-
-		if self.config.ISOChecksumType == "" {
+		if self.config.ScriptUrl == "" {
 			errs = packer.MultiErrorAppend(
-				errs, errors.New("The iso_checksum_type must be specified."))
-		} else {
-			self.config.ISOChecksumType = strings.ToLower(self.config.ISOChecksumType)
-			if self.config.ISOChecksumType != "none" {
-				if self.config.ISOChecksum == "" {
-					errs = packer.MultiErrorAppend(
-						errs, errors.New("Due to the file size being large, an iso_checksum is required."))
-				} else {
-					self.config.ISOChecksum = strings.ToLower(self.config.ISOChecksum)
-				}
-
-				if hash := common.HashForType(self.config.ISOChecksumType); hash == nil {
-					errs = packer.MultiErrorAppend(
-						errs, fmt.Errorf("Unsupported checksum type: %s", self.config.ISOChecksumType))
-				}
-
-			}
+				errs, errors.New("You must specify the URL of the copyiso script"))
 		}
 
-		if len(self.config.ISOUrls) == 0 {
-			if self.config.ISOUrl == "" {
-				errs = packer.MultiErrorAppend(
-					errs, errors.New("One of iso_url or iso_urls must be specified."))
-			} else {
-				self.config.ISOUrls = []string{self.config.ISOUrl}
-			}
-		} else if self.config.ISOUrl != "" {
+		if self.config.ISOSRName == "" {
 			errs = packer.MultiErrorAppend(
-				errs, errors.New("Only one of iso_url or iso_urls may be specified."))
-		}
-
-		for i, url := range self.config.ISOUrls {
-			self.config.ISOUrls[i], err = common.DownloadableURL(url)
-			if err != nil {
-				errs = packer.MultiErrorAppend(
-					errs, fmt.Errorf("Failed to parse iso_urls[%d]: %s", i, err))
-			}
+				errs, errors.New("You must specify the SR for the ISO"))
 		}
 	}
 
@@ -234,6 +209,15 @@ func (self *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (pa
 		&xscommon.StepPrepareOutputDir{
 			Force: self.config.PackerForce,
 			Path:  self.config.OutputDir,
+		},
+		&xscommon.StepPrepareNfsExport{
+			NfsMount: self.config.NfsMount,
+		},
+		&xscommon.StepIsoDownload{
+			IsoName:   self.config.ISOName,
+			SrName:    self.config.ISOSRName,
+			DlUrl:     self.config.ISOUrl,
+			ScriptUrl: self.config.ScriptUrl,
 		},
 		&common.StepCreateFloppy{
 			Files: self.config.FloppyFiles,
@@ -336,15 +320,8 @@ func (self *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (pa
 		&xscommon.StepDetachVdi{
 			VdiUuidKey: "tools_vdi_uuid",
 		},
-		&xscommon.StepDetachVdi{
-			VdiUuidKey: "floppy_vdi_uuid",
-		},
-		new(xscommon.StepConfigureDiscDrives),
-		new(xscommon.StepConvertToTemplate),
-		new(xscommon.StepDestroyVIFs),
-		&xscommon.StepExecuteHostScripts{
-			ScriptType:   "pre-export",
-			LocalScripts: self.config.PreExportHostScripts,
+		&xscommon.StepExport{
+			OutputFormat: self.config.Format,
 		},
 		new(xscommon.StepExport),
 	}
@@ -368,7 +345,20 @@ func (self *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (pa
 		return nil, errors.New("Build was halted.")
 	}
 
-	artifact, _ := xscommon.NewArtifact(self.config.OutputDir)
+	artifactState := make(map[string]interface{})
+	if len(state.Get("virtualization_type").(string)) == 0 {
+		artifactState["virtualizationType"] = "PV"
+	} else {
+		artifactState["virtualizationType"] = "HVM"
+	}
+
+	for diskname, disksize := range self.config.VMDisks {
+		artifactState[fmt.Sprintf("diskSize_%s", diskname)] = fmt.Sprintf("%d", disksize)
+	}
+	artifactState["ramSize"] = fmt.Sprintf("%d", self.config.VMMemory)
+	artifactState["vm_name"] = self.config.VMName
+
+	artifact, _ := xscommon.NewArtifact(self.config.OutputDir, artifactState, state.Get("export_files").([]string))
 
 	return artifact, nil
 }
