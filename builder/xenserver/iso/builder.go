@@ -327,6 +327,10 @@ func (self *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (pa
 		},
 		new(common.StepProvision),
 		new(xscommon.StepShutdown),
+		&xscommon.StepExecuteHostScripts{
+			ScriptType:   "pre-template",
+			LocalScripts: self.config.PreTemplateHostScripts,
+		},
 		&xscommon.StepDetachVdi{
 			VdiUuidKey: "iso_vdi_uuid",
 		},

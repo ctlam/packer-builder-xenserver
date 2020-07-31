@@ -184,8 +184,8 @@ func (self *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (pa
 		new(common.StepProvision),
 		new(xscommon.StepShutdown),
 		&xscommon.StepExecuteHostScripts{
-			ScriptType:   "pre-export",
-			LocalScripts: self.config.PreExportHostScripts,
+			ScriptType:   "pre-template",
+			LocalScripts: self.config.PreTemplateHostScripts,
 		},
 		&xscommon.StepDetachVdi{
 			VdiUuidKey: "floppy_vdi_uuid",
@@ -196,6 +196,10 @@ func (self *Builder) Run(ui packer.Ui, hook packer.Hook, cache packer.Cache) (pa
 		new(xscommon.StepConfigureDiscDrives),
 		new(xscommon.StepConvertToTemplate),
 		new(xscommon.StepDestroyVIFs),
+		&xscommon.StepExecuteHostScripts{
+			ScriptType:   "pre-export",
+			LocalScripts: self.config.PreExportHostScripts,
+		},
 		new(xscommon.StepExport),
 	}
 
